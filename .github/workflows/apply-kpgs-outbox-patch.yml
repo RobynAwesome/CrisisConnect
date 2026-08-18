@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - "agent/kpgs-durable-outbox"
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -15,7 +17,7 @@ concurrency:
 
 jobs:
   patch:
-    if: github.event.head_commit.message != 'feat(kpgs): integrate durable outbox into adaptive PWA'
+    if: github.event_name != 'push' || github.event.head_commit.message != 'feat(kpgs): integrate durable outbox into adaptive PWA'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
