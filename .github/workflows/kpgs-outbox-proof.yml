@@ -1,0 +1,77 @@
+name: KPGS Durable Outbox Proof
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches:
+      - "agent/kpgs-durable-outbox"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crisisconnect-kpgs-proof-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proof:
+    name: Syntax · Durable replay · Truth boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout exact head
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: JavaScript syntax proof
+        run: |
+          node --check app.js
+          node --check sw.js
+          node --check kpgs-outbox.js
+          node --check kpgs-runtime-adapter.js
+          node --check tests/kpgs-outbox.test.cjs
+
+      - name: Durable outbox and governance tests
+        run: node --test tests/kpgs-outbox.test.cjs
+
+      - name: Static PWA integration and no-false-completion proof
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+
+          sw = Path('sw.js').read_text(encoding='utf-8')
+          runtime = Path('kpgs-runtime-adapter.js').read_text(encoding='utf-8')
+          outbox = Path('kpgs-outbox.js').read_text(encoding='utf-8')
+          config = json.loads(Path('kpgs_config.json').read_text(encoding='utf-8'))
+
+          assert "'/kpgs-runtime-adapter.js'" in sw
+          assert 'injectGovernedRuntime' in sw
+          assert "if (result.complete)" in sw
+          assert "type: 'SYNC_COMPLETE'" in sw
+          assert "type: 'SYNC_PENDING'" in sw
+          assert "SYNC_COMPLETE', ts" not in sw, 'legacy unconditional completion signature returned'
+
+          assert "event.stopImmediatePropagation()" in runtime
+          assert "event.target.id !== 'reportForm'" in runtime
+          assert 'pending proposal — no dispatch or verification confirmed' in runtime
+
+          assert "state_class: 'pending_proposal'" in outbox
+          assert "boundary_marker: '#NB'" in outbox
+          assert "authority_effect: 'none'" in outbox
+          assert "transportGrantsAuthority: false" in outbox
+          assert "distribution: stage('NOT_REACHED'" in outbox
+          assert 'IndexedDB transaction is admitted' in outbox
+
+          assert config.get('sync_endpoint') is None
+          assert config.get('sync_state') == 'HOLD_NO_CONFIGURED_SINK'
+          assert 'never verifies incident truth' in config.get('truth_boundary', '')
+
+          print('CrisisConnect KPGS outbox static proof: PASS')
