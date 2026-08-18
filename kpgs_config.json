@@ -6,6 +6,15 @@
   "main_brain_ref": "Schematics/21-KOPANO-PHU GOVERNACE SYSTEMS/MAIN-BRAIN/KPGS_GOVERNANCE_CORE.json",
   "github_repo": "https://github.com/Kopano-Labs/CrisisConnect",
   "vercel_url": "https://crisisconnect.kopanolabs.com",
+  "progressive_updates": {
+    "canonical_source": "RobynAwesome/Introduction-to-MCP@70f40324978ee8c3c1a8a77a29e6ac84c7f6bf3a",
+    "protocol": "kpgs.progressive-update.v1",
+    "lane": "incident-report-outbox",
+    "state_class": "pending_proposal",
+    "authority_effect": "none",
+    "sync_endpoint": null,
+    "sync_endpoint_status": "UNCONFIGURED_DO_NOT_CLAIM_DISTRIBUTION"
+  },
   "verification": {
     "auditor": "self_audit.py",
     "required_files": ["index.html", "index.css", "app.js", "self_audit.py"],
