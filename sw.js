@@ -5,7 +5,7 @@
 
 importScripts('/kpgs-outbox.js');
 
-const CACHE_VERSION = 'cc-adaptive-v2';
+const CACHE_VERSION = 'cc-adaptive-v3';
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const DATA_CACHE = `${CACHE_VERSION}-data`;
 
@@ -15,6 +15,7 @@ const SHELL_ASSETS = [
   '/index.css',
   '/app.js',
   '/kpgs-outbox.js',
+  '/kpgs-runtime-adapter.js',
   '/kpgs_config.json',
   '/manifest.json'
 ];
@@ -40,6 +41,47 @@ self.addEventListener('activate', (event) => {
   );
 });
 
+async function injectGovernedRuntime(response) {
+  if (!response) return response;
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('text/html')) return response;
+
+  const html = await response.clone().text();
+  if (html.includes('kpgs-runtime-adapter.js')) return response;
+
+  const marker = '<script src="app.js"></script>';
+  if (!html.includes(marker)) return response;
+
+  const injected = html.replace(
+    marker,
+    `${marker}\n  <script src="kpgs-outbox.js"></script>\n  <script src="kpgs-runtime-adapter.js"></script>`
+  );
+
+  const headers = new Headers(response.headers);
+  headers.delete('content-length');
+  return new Response(injected, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+async function shellResponse(request) {
+  let response = await caches.match(request);
+  if (!response) {
+    response = await fetch(request);
+    if (response && response.status === 200) {
+      const cache = await caches.open(SHELL_CACHE);
+      await cache.put(request, response.clone());
+    }
+  }
+
+  if (request.mode === 'navigate') {
+    return injectGovernedRuntime(response);
+  }
+  return response;
+}
+
 /* ── Fetch: adaptive caching strategy ──────────────────── */
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
@@ -58,25 +100,13 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Shell assets: cache-first, fall back to network
   event.respondWith(
-    caches.match(event.request)
-      .then(cached => {
-        if (cached) return cached;
-        return fetch(event.request).then(response => {
-          if (response.status === 200) {
-            const clone = response.clone();
-            caches.open(SHELL_CACHE).then(cache => cache.put(event.request, clone));
-          }
-          return response;
-        });
-      })
-      .catch(() => {
-        // Offline fallback for navigation
-        if (event.request.mode === 'navigate') {
-          return caches.match('/index.html');
-        }
-      })
+    shellResponse(event.request).catch(async () => {
+      if (event.request.mode === 'navigate') {
+        return injectGovernedRuntime(await caches.match('/index.html'));
+      }
+      return caches.match(event.request);
+    })
   );
 });
 
