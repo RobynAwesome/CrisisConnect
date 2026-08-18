@@ -1,0 +1,44 @@
+name: KPGS Incident Outbox Proof
+
+on:
+  pull_request:
+    paths:
+      - "app.js"
+      - "outbox.js"
+      - "sw.js"
+      - "self_audit.py"
+      - ".github/workflows/kpgs-outbox-proof.yml"
+  push:
+    branches:
+      - "kpgs-*"
+    paths:
+      - "app.js"
+      - "outbox.js"
+      - "sw.js"
+      - "self_audit.py"
+      - ".github/workflows/kpgs-outbox-proof.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Syntax-check browser and service-worker runtimes
+        run: |
+          node --check app.js
+          node --check outbox.js
+          node --check sw.js
+      - name: Compile audit
+        run: python -m py_compile self_audit.py
+      - name: Prove canonical outbox contract
+        run: python self_audit.py
