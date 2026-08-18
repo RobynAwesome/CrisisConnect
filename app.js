@@ -35,18 +35,136 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
 
+  /* ── KPGS governed outbox loader ────────────────────────── */
+  let outboxLoader = null;
+
+  function ensureOutbox() {
+    if (window.CrisisOutbox) return Promise.resolve(window.CrisisOutbox);
+    if (outboxLoader) return outboxLoader;
+
+    outboxLoader = new Promise((resolve, reject) => {
+      const existing = document.querySelector('script[data-crisis-outbox]');
+      if (existing) {
+        existing.addEventListener('load', () => resolve(window.CrisisOutbox), { once: true });
+        existing.addEventListener('error', () => reject(new Error('Governed outbox failed to load')), { once: true });
+        return;
+      }
+      const script = document.createElement('script');
+      script.src = '/outbox.js';
+      script.async = true;
+      script.dataset.crisisOutbox = 'true';
+      script.addEventListener('load', () => {
+        if (!window.CrisisOutbox) {
+          reject(new Error('Governed outbox runtime unavailable after script load'));
+          return;
+        }
+        resolve(window.CrisisOutbox);
+      }, { once: true });
+      script.addEventListener('error', () => reject(new Error('Governed outbox failed to load')), { once: true });
+      document.head.appendChild(script);
+    });
+
+    return outboxLoader;
+  }
+
+  function configuredSyncEndpoint() {
+    if (typeof window.CRISISCONNECT_SYNC_ENDPOINT === 'string' && window.CRISISCONNECT_SYNC_ENDPOINT.trim()) {
+      return window.CRISISCONNECT_SYNC_ENDPOINT.trim();
+    }
+    const meta = document.querySelector('meta[name="crisisconnect-sync-endpoint"]');
+    return meta && typeof meta.content === 'string' ? meta.content.trim() : '';
+  }
+
+  async function refreshOutboxState() {
+    try {
+      const outbox = await ensureOutbox();
+      const endpoint = configuredSyncEndpoint();
+      if (endpoint) await outbox.configureEndpoint(endpoint);
+      const pending = await outbox.listPending();
+      state.offlineQueue = pending;
+
+      // Pending proposals survive process loss. Rehydrate them into the visible
+      // incident list as unverified testimony without promoting them to truth.
+      for (const record of pending) {
+        if (record.report && !state.incidents.some(incident => incident.id === record.report.id)) {
+          state.incidents.unshift(record.report);
+        }
+      }
+      updateQueueBanner();
+      renderIncidents();
+      updateStats();
+      return pending;
+    } catch (error) {
+      console.warn('[CC] Governed outbox unavailable:', error);
+      return state.offlineQueue;
+    }
+  }
+
+  async function syncOutboxNow({ announce = true } = {}) {
+    if (!navigator.onLine) {
+      if (announce) toast('Cannot deliver — no connectivity. Report remains saved locally.', 'warning');
+      return { status: 'pending', pending: state.offlineQueue.length, delivered: 0, failed: 0 };
+    }
+
+    try {
+      const outbox = await ensureOutbox();
+      const endpoint = configuredSyncEndpoint();
+      if (endpoint) await outbox.configureEndpoint(endpoint);
+      const result = await outbox.syncPending(endpoint);
+      await refreshOutboxState();
+
+      if (result.status === 'complete' && result.delivered > 0) {
+        state.lastSync = new Date();
+        updateSyncDisplay();
+        incrementSyncedCount(result.delivered);
+        if (announce) toast(`${result.delivered} locally saved report${result.delivered === 1 ? '' : 's'} delivered with SWFUS receipt`, 'success');
+      } else if (result.reason === 'NO_ENDPOINT') {
+        if (announce) toast('Saved locally. No governed remote sync endpoint is configured yet.', 'warning');
+      } else if (result.failed > 0) {
+        if (announce) toast('Delivery not confirmed. Report remains safely in the local outbox.', 'warning');
+      } else if (announce && result.pending > 0) {
+        toast('Report remains pending until delivery is confirmed.', 'info');
+      }
+      return result;
+    } catch (error) {
+      console.warn('[CC] Governed outbox delivery failed:', error);
+      if (announce) toast('Delivery not confirmed. Local outbox retained.', 'warning');
+      await refreshOutboxState();
+      return { status: 'pending', pending: state.offlineQueue.length, delivered: 0, failed: 1 };
+    }
+  }
+
   /* ── 1. Service Worker Registration ─────────────────────── */
   function registerSW() {
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js')
         .then(reg => {
           console.log('[CC] Service Worker registered:', reg.scope);
-          // Listen for sync messages
-          navigator.serviceWorker.addEventListener('message', (event) => {
-            if (event.data.type === 'SYNC_COMPLETE') {
-              toast('Offline queue synced successfully', 'success');
+          navigator.serviceWorker.addEventListener('message', async (event) => {
+            if (!event.data || !event.data.type) return;
+
+            if (event.data.type === 'SYNC_COMPLETE' && Number(event.data.delivered) > 0) {
               state.lastSync = new Date();
               updateSyncDisplay();
+              incrementSyncedCount(Number(event.data.delivered));
+              await refreshOutboxState();
+              toast(`${event.data.delivered} queued report${event.data.delivered === 1 ? '' : 's'} delivered with confirmed receipt`, 'success');
+              return;
+            }
+
+            if (event.data.type === 'OUTBOX_PENDING') {
+              await refreshOutboxState();
+              if (event.data.reason === 'NO_ENDPOINT') {
+                toast('Reports remain saved locally — no remote delivery endpoint configured.', 'warning');
+              } else if (Number(event.data.failed) > 0) {
+                toast('Remote delivery was not confirmed. Local outbox retained.', 'warning');
+              }
+              return;
+            }
+
+            if (event.data.type === 'OUTBOX_FAILED') {
+              await refreshOutboxState();
+              toast('Background delivery failed. Local outbox retained.', 'warning');
             }
           });
         })
@@ -68,7 +186,6 @@
         state.connectivity = 'online';
       }
 
-      // Update UI
       const badge = $('#connectionBadge');
       const label = $('#connectionLabel');
       badge.setAttribute('data-status', state.connectivity);
@@ -76,12 +193,18 @@
       const labels = { online: 'Online', degraded: 'Degraded', offline: 'Offline' };
       label.textContent = labels[state.connectivity];
 
-      // Body class for CSS hooks
       document.body.classList.toggle('is-offline', state.connectivity === 'offline');
       document.body.classList.toggle('is-degraded', state.connectivity === 'degraded');
 
-      // Show/hide queue banner
       updateQueueBanner();
+      if (online) {
+        void syncOutboxNow({ announce: false });
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.ready.then(reg => {
+            if (reg.active) reg.active.postMessage({ type: 'PROCESS_OUTBOX' });
+          }).catch(() => {});
+        }
+      }
     }
 
     window.addEventListener('online', updateStatus);
@@ -126,17 +249,12 @@
     $('#roleIcon').textContent = icon;
     $('#roleLabel').textContent = label.split(' ').slice(1).join(' ') || label;
 
-    // Update active state
     $$('.role-option').forEach(o => o.classList.toggle('active', o.dataset.role === role));
-
-    // Role-specific nav adjustments
     updateNavForRole(role);
     toast(`Role switched to ${label}`, 'info');
   }
 
   function updateNavForRole(role) {
-    // All roles see dashboard and incidents
-    // Role-specific visibility could be expanded here
     const navItems = {
       citizen: ['dashboard', 'incidents', 'report', 'map', 'adaptation', 'ecosystem'],
       operator: ['dashboard', 'incidents', 'report', 'map', 'queue', 'adaptation', 'ecosystem'],
@@ -177,23 +295,19 @@
 
   /* ── 5. Device Adaptation ───────────────────────────────── */
   function detectDevice() {
-    const ua = navigator.userAgent;
     const width = window.innerWidth;
     let deviceClass = 'desktop';
 
     if (width <= 640) deviceClass = 'mobile';
     else if (width <= 1024) deviceClass = 'tablet';
 
-    // Cheap device detection heuristic
     const memory = navigator.deviceMemory;
-    const cores = navigator.hardwareConcurrency;
     if (memory && memory <= 2) deviceClass += ' (low-end)';
     else if (memory && memory >= 8) deviceClass += ' (high-end)';
 
     state.deviceClass = deviceClass;
     $('#deviceClass').textContent = deviceClass;
 
-    // Network type
     const conn = navigator.connection;
     if (conn) {
       state.networkType = `${conn.effectiveType || 'unknown'} (${conn.downlink || '?'} Mbps)`;
@@ -202,7 +316,6 @@
       $('#networkType').textContent = navigator.onLine ? 'online' : 'offline';
     }
 
-    // Battery
     if ('getBattery' in navigator) {
       navigator.getBattery().then(battery => {
         const level = Math.round(battery.level * 100);
@@ -217,7 +330,6 @@
       });
     }
 
-    // Cache estimate
     if ('storage' in navigator && 'estimate' in navigator.storage) {
       navigator.storage.estimate().then(est => {
         const used = (est.usage / 1024 / 1024).toFixed(1);
@@ -233,18 +345,13 @@
       item.addEventListener('click', () => {
         const view = item.dataset.view;
         showView(view);
-
-        // Update active nav
         $$('.nav-item').forEach(n => n.classList.remove('active'));
         item.classList.add('active');
-
-        // Close mobile sidebar
         $('#appSidebar').classList.remove('open');
         $('#sidebarOverlay').classList.remove('visible');
       });
     });
 
-    // Mobile menu toggle
     $('#menuToggle').addEventListener('click', () => {
       $('#appSidebar').classList.toggle('open');
       $('#sidebarOverlay').classList.toggle('visible');
@@ -281,7 +388,6 @@
     if (dashList) dashList.innerHTML = html;
     if (fullList) fullList.innerHTML = html;
 
-    // Update timestamp
     const ts = new Date().toLocaleTimeString();
     const tsEl = $('#incidentListTime');
     if (tsEl) tsEl.textContent = ts;
@@ -301,7 +407,7 @@
       {
         dimension: '2. Role',
         status: `Active: ${state.role.charAt(0).toUpperCase() + state.role.slice(1)}`,
-        detail: `UI composition adapted · nav filtered · data density adjusted`
+        detail: 'UI composition adapted · nav filtered · data density adjusted'
       },
       {
         dimension: '3. Urgency',
@@ -316,12 +422,12 @@
       {
         dimension: '5. Trust',
         status: `${state.incidents.filter(i => i.trust === 'verified').length} verified · ${state.incidents.filter(i => i.trust === 'unverified').length} unverified · ${state.incidents.filter(i => i.trust === 'disputed').length} disputed`,
-        detail: `Chain-of-custody: enabled · Stale threshold: 30min · Duplicate detection: active`
+        detail: 'Local testimony remains unverified until an external verification workflow supplies evidence'
       },
       {
         dimension: '6. Local Context',
         status: 'Region: Western Cape, ZA',
-        detail: `Language: en-ZA · Hazard profile: flood/fire/gbv · Protocol set: SAPS+EMS+metro · Network cost: medium`
+        detail: 'Language: en-ZA · Hazard profile: flood/fire/gbv · Protocol set: SAPS+EMS+metro · Network cost: medium'
       }
     ];
 
@@ -342,11 +448,11 @@
     const form = $('#reportForm');
     if (!form) return;
 
-    form.addEventListener('submit', (e) => {
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
 
       const report = {
-        id: `INC-${String(state.incidents.length + 1).padStart(3, '0')}`,
+        id: `LOCAL-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         type: $('#incidentType').value,
         severity: $('#incidentSeverity').value,
         title: `${$('#incidentType').selectedOptions[0]?.text || 'Report'} — ${$('#incidentLocation').value}`,
@@ -356,31 +462,38 @@
         time: 'just now',
         trust: 'unverified',
         timestamp: new Date().toISOString(),
-        synced: navigator.onLine
+        synced: false
       };
 
-      if (navigator.onLine) {
-        // Simulate API call
-        state.incidents.unshift(report);
-        renderIncidents();
-        toast('Incident reported successfully', 'success');
-      } else {
-        // Queue for offline sync
-        state.offlineQueue.push(report);
-        state.incidents.unshift(report);
-        updateQueueBanner();
-        renderIncidents();
-        toast('Report queued — will sync when online', 'warning');
-
-        // Try background sync
-        if ('serviceWorker' in navigator && 'SyncManager' in window) {
-          navigator.serviceWorker.ready.then(reg => reg.sync.register('cc-offline-queue'));
+      try {
+        const outbox = await ensureOutbox();
+        const result = await outbox.enqueueReport(report);
+        if (!result.persisted) {
+          const failed = result.receipt.stages.find(item => item.status === 'HOLD' || item.status === 'REJECT');
+          toast(`Report not saved: ${failed ? failed.reason : 'governance gate blocked local persistence'}`, 'error');
+          return;
         }
-      }
 
-      form.reset();
-      // Update stats
-      updateStats();
+        state.incidents.unshift(result.record.report);
+        await refreshOutboxState();
+        renderAdaptationStatus();
+        toast('Report saved locally as an unverified pending proposal', 'warning');
+        form.reset();
+        updateStats();
+
+        if ('serviceWorker' in navigator && 'SyncManager' in window) {
+          navigator.serviceWorker.ready
+            .then(reg => reg.sync.register('cc-offline-queue'))
+            .catch(() => {});
+        }
+
+        if (navigator.onLine) {
+          void syncOutboxNow({ announce: false });
+        }
+      } catch (error) {
+        console.error('[CC] Report outbox failure:', error);
+        toast('Report could not be persisted locally. Please keep your information and retry.', 'error');
+      }
     });
   }
 
@@ -391,6 +504,7 @@
     const queueCount = $('#queueCount');
     const queueBadge = $('#queueBadge');
     const statQueued = $('#statQueued');
+    const queueList = $('#queueList');
 
     if (count > 0) {
       banner.classList.add('visible');
@@ -403,6 +517,22 @@
     }
 
     if (statQueued) statQueued.textContent = count;
+    if (queueList) {
+      if (count === 0) {
+        queueList.innerHTML = '<p class="text-muted" style="padding: 2rem; text-align: center;">No pending local outbox items ✅</p>';
+      } else {
+        queueList.innerHTML = state.offlineQueue.map(record => `
+          <div class="incident-item">
+            <div class="incident-severity ${record.report?.severity || 'medium'}"></div>
+            <div class="incident-info">
+              <h4>${record.report?.title || 'Pending incident proposal'}</h4>
+              <p>Saved locally · ${record.update_id}</p>
+            </div>
+            <span class="trust-badge unverified">pending</span>
+          </div>
+        `).join('');
+      }
+    }
   }
 
   /* ── 11. Stats Update ───────────────────────────────────── */
@@ -429,7 +559,6 @@
       else if (diff < 3600) el.textContent = `${Math.floor(diff / 60)}m ago`;
       else el.textContent = `${Math.floor(diff / 3600)}h ago`;
 
-      // Stale warning
       if (diff > 1800) {
         el.classList.add('stale-warning');
         el.textContent += ' ⚠️';
@@ -489,25 +618,13 @@
     const syncBtn = $('#forceSync');
     const syncAllBtn = $('#syncAll');
 
-    function doSync() {
+    async function doSync() {
+      await refreshOutboxState();
       if (state.offlineQueue.length === 0) {
-        toast('Nothing to sync', 'info');
+        toast('Nothing pending in the local outbox', 'info');
         return;
       }
-      if (!navigator.onLine) {
-        toast('Cannot sync — no connectivity', 'error');
-        return;
-      }
-
-      // Simulate sync
-      toast(`Syncing ${state.offlineQueue.length} items...`, 'info');
-      setTimeout(() => {
-        state.offlineQueue = [];
-        state.lastSync = new Date();
-        updateQueueBanner();
-        updateSyncDisplay();
-        toast('All items synced successfully', 'success');
-      }, 1500);
+      await syncOutboxNow({ announce: true });
     }
 
     if (syncBtn) syncBtn.addEventListener('click', doSync);
@@ -527,6 +644,7 @@
   /* ── INIT ───────────────────────────────────────────────── */
   function init() {
     registerSW();
+    void refreshOutboxState();
     initConnectivity();
     initRoleSelector();
     initUrgencySelector();
@@ -541,26 +659,19 @@
     initForceSync();
     initClock();
     updateStats();
-    initUserMenu();  // ── USER DROP MENU ─────────────────────
+    initUserMenu();
 
-    // Set initial role
     setRole('citizen', '👤', '👤 Citizen');
 
     console.log('[CrisisConnect] Adaptive PWA initialized');
     console.log('[CrisisConnect] 6 dimensions active: connectivity, role, urgency, device, trust, local');
+    console.log('[CrisisConnect] Incident reports: durable local pending_proposal outbox; remote delivery requires SWFUS receipt');
     console.log('[CrisisConnect] USER DROP MENU: active | IKP: CLEAN | 360DP: VIP ####!!!!');
   }
 
   /* ── 17. USER DROP MENU (UMP) ───────────────────────────── */
-  /*
-   * USER DROP MENU — Pilot profile dropdown
-   * KPGS: IKP CLEAN | 360DP VIP ####!!!! | DSO HDSO ###!!!
-   * localStorage key: cc_pilot_profile
-   * Stores: callsign, role, reports_count, synced_count, session_start
-   * I_AM_STATELESS_RENTER_NOT_LANDLORD
-   */
   const UMP_KEY       = 'cc_pilot_profile';
-  const UMP_ALP_COUNT = 13;    // current ALP activation count
+  const UMP_ALP_COUNT = 13;
   const UMP_DSO       = 'HDSO ###!!!';
   const UMP_IKP       = 'IKP: CLEAN';
   const UMP_360DP     = '360DP: VIP ####!!!!';
@@ -574,6 +685,15 @@
 
   function savePilot(profile) {
     try { localStorage.setItem(UMP_KEY, JSON.stringify(profile)); } catch (_) {}
+  }
+
+  function incrementSyncedCount(count) {
+    if (!Number.isFinite(count) || count <= 0) return;
+    const pilot = loadPilot() || {};
+    pilot.synced_count = (pilot.synced_count || 0) + count;
+    savePilot(pilot);
+    const panel = $('#userMenuPanel');
+    if (panel && !panel.classList.contains('is-hidden')) umpRender(pilot);
   }
 
   function getInitials(callsign) {
@@ -598,13 +718,11 @@
     const session   = (pilot && pilot.session_start) ? formatSessionTime(pilot.session_start) : '0m';
     const roleLabel = state.role.charAt(0).toUpperCase() + state.role.slice(1);
 
-    // Trigger button
     const avatarEl    = $('#userAvatar');
     const callsignEl  = $('#userCallsign');
     if (avatarEl)   avatarEl.textContent   = initials;
     if (callsignEl) callsignEl.textContent = callsign;
 
-    // Panel
     const nameEl    = $('#umpName');
     const roleEl    = $('#umpRole');
     const avatarLg  = $('#umpAvatarLg');
@@ -628,11 +746,9 @@
     if (dpEl)     dpEl.textContent    = UMP_360DP;
     if (dsoEl)    dsoEl.textContent   = `DSO: ${UMP_DSO}`;
 
-    // Urgency toggle label
     const nextUrgency = { normal: 'active', active: 'mass', mass: 'normal' }[state.urgency];
     if (urgEl) urgEl.textContent = `Switch to ${nextUrgency} mode`;
 
-    // Offline queue badge in UMP
     const qBadge = $('#umpQueueBadge');
     if (qBadge) {
       const qCount = state.offlineQueue.length;
@@ -668,7 +784,6 @@
   }
 
   function initUserMenu() {
-    // Ensure/bootstrap pilot profile
     let pilot = loadPilot();
     if (!pilot) {
       pilot = {
@@ -682,16 +797,13 @@
       };
       savePilot(pilot);
     } else {
-      // Refresh session start on each boot
       pilot.session_start = new Date().toISOString();
       pilot.alp_count     = UMP_ALP_COUNT;
       savePilot(pilot);
     }
 
-    // Render initial state into trigger button
     umpRender(pilot);
 
-    // Toggle on trigger click
     const trigger = $('#userMenuTrigger');
     if (trigger) {
       trigger.addEventListener('click', (e) => {
@@ -700,7 +812,6 @@
       });
     }
 
-    // Close on outside click
     document.addEventListener('click', (e) => {
       const wrap = $('#userMenuWrap');
       if (wrap && !wrap.contains(e.target)) {
@@ -708,12 +819,10 @@
       }
     });
 
-    // Close on Escape
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') umpClose();
     });
 
-    // Edit callsign
     const umpEdit = $('#umpEditProfile');
     if (umpEdit) {
       umpEdit.addEventListener('click', () => {
@@ -727,7 +836,6 @@
       });
     }
 
-    // Save callsign
     const umpSave = $('#umpCallsignSave');
     if (umpSave) {
       umpSave.addEventListener('click', () => {
@@ -744,7 +852,6 @@
       });
     }
 
-    // Cancel callsign modal
     const umpCancel = $('#umpCallsignCancel');
     if (umpCancel) {
       umpCancel.addEventListener('click', () => {
@@ -753,7 +860,6 @@
       });
     }
 
-    // Enter key in callsign input → save
     const umpInput = $('#umpCallsignInput');
     if (umpInput) {
       umpInput.addEventListener('keydown', (e) => {
@@ -761,7 +867,6 @@
       });
     }
 
-    // View offline queue
     const umpQueue = $('#umpViewQueue');
     if (umpQueue) {
       umpQueue.addEventListener('click', () => {
@@ -772,7 +877,6 @@
       });
     }
 
-    // Toggle urgency
     const umpUrgency = $('#umpToggleUrgency');
     if (umpUrgency) {
       umpUrgency.addEventListener('click', () => {
@@ -782,7 +886,6 @@
       });
     }
 
-    // Go to ecosystem
     const umpEco = $('#umpEcosystem');
     if (umpEco) {
       umpEco.addEventListener('click', () => {
@@ -793,12 +896,11 @@
       });
     }
 
-    // Sign out / reset pilot
     const umpOut = $('#umpSignOut');
     if (umpOut) {
       umpOut.addEventListener('click', () => {
         umpClose();
-        if (!confirm('Reset all pilot data on this device? This cannot be undone.')) return;
+        if (!confirm('Reset pilot profile on this device? Pending incident reports are kept in the governed outbox.')) return;
         localStorage.removeItem(UMP_KEY);
         const fresh = {
           callsign:      'Guest',
@@ -811,25 +913,23 @@
         };
         savePilot(fresh);
         umpRender(fresh);
-        toast('Pilot data reset. Flying as Guest.', 'info');
+        toast('Pilot profile reset. Pending incident proposals were preserved.', 'info');
       });
     }
 
-    // Hook: track reports in profile
     const reportForm = $('#reportForm');
     if (reportForm) {
       reportForm.addEventListener('submit', () => {
         const p = loadPilot() || {};
         p.reports_count = (p.reports_count || 0) + 1;
-        if (navigator.onLine) p.synced_count = (p.synced_count || 0) + 1;
+        // Online connectivity is not synchronization. synced_count changes only
+        // after a confirmed remote SWFUS receipt.
         savePilot(p);
-        // Update session timer in panel if open
         const panel = $('#userMenuPanel');
         if (panel && !panel.classList.contains('is-hidden')) umpRender(p);
       });
     }
 
-    // Refresh session timer every 60s
     setInterval(() => {
       const panel = $('#userMenuPanel');
       if (panel && !panel.classList.contains('is-hidden')) {
@@ -844,4 +944,3 @@
     init();
   }
 })();
-
