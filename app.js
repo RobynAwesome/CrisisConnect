@@ -6,12 +6,21 @@
 (function () {
   'use strict';
 
+  // Domain adapter loaded lazily without changing the static index/app-shell shape.
+  const kpgsRuntimePromise = import('/kpgs-progressive.js')
+    .then(() => {
+      if (!globalThis.CCKpgs) throw new Error('CCKpgs runtime did not initialize');
+      return globalThis.CCKpgs;
+    });
+
   /* ── State ──────────────────────────────────────────────── */
   const state = {
     role: 'citizen',
     urgency: 'normal',
     connectivity: 'online',
-    lastSync: new Date(),
+    // A boot timestamp is not a sync receipt. Null remains visible until an
+    // upstream endpoint actually confirms delivery.
+    lastSync: null,
     offlineQueue: [],
     incidents: [],
     deviceClass: 'unknown',
@@ -35,18 +44,58 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
 
+  async function refreshDurableOutbox() {
+    try {
+      const runtime = await kpgsRuntimePromise;
+      const pending = await runtime.listPendingOutbox();
+      state.offlineQueue = pending.map(record => record.payload);
+      updateQueueBanner();
+      return pending;
+    } catch (error) {
+      console.warn('[CC/KPGS] Unable to read durable outbox:', error);
+      return [];
+    }
+  }
+
+  function incrementConfirmedSyncCount(delivered) {
+    const count = Number(delivered || 0);
+    if (!count) return;
+    const pilot = loadPilot();
+    if (!pilot) return;
+    pilot.synced_count = (pilot.synced_count || 0) + count;
+    savePilot(pilot);
+    const panel = $('#userMenuPanel');
+    if (panel && !panel.classList.contains('is-hidden')) umpRender(pilot);
+  }
+
   /* ── 1. Service Worker Registration ─────────────────────── */
   function registerSW() {
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js')
         .then(reg => {
           console.log('[CC] Service Worker registered:', reg.scope);
-          // Listen for sync messages
           navigator.serviceWorker.addEventListener('message', (event) => {
+            if (!event.data || !event.data.type) return;
+
             if (event.data.type === 'SYNC_COMPLETE') {
-              toast('Offline queue synced successfully', 'success');
-              state.lastSync = new Date();
+              // This message now exists only after a configured endpoint returned
+              // success for every pending update processed by the worker.
+              toast(`Confirmed sync complete · ${event.data.delivered || 0} delivered`, 'success');
+              state.lastSync = new Date(event.data.ts || Date.now());
+              incrementConfirmedSyncCount(event.data.delivered);
+              refreshDurableOutbox();
               updateSyncDisplay();
+              return;
+            }
+
+            if (event.data.type === 'SYNC_PENDING') {
+              refreshDurableOutbox();
+              console.info('[CC/KPGS] Sync remains pending:', event.data);
+              return;
+            }
+
+            if (event.data.type === 'SYNC_IDLE') {
+              refreshDurableOutbox();
             }
           });
         })
@@ -68,7 +117,6 @@
         state.connectivity = 'online';
       }
 
-      // Update UI
       const badge = $('#connectionBadge');
       const label = $('#connectionLabel');
       badge.setAttribute('data-status', state.connectivity);
@@ -76,12 +124,9 @@
       const labels = { online: 'Online', degraded: 'Degraded', offline: 'Offline' };
       label.textContent = labels[state.connectivity];
 
-      // Body class for CSS hooks
       document.body.classList.toggle('is-offline', state.connectivity === 'offline');
       document.body.classList.toggle('is-degraded', state.connectivity === 'degraded');
-
-      // Show/hide queue banner
-      updateQueueBanner();
+      refreshDurableOutbox();
     }
 
     window.addEventListener('online', updateStatus);
@@ -126,17 +171,12 @@
     $('#roleIcon').textContent = icon;
     $('#roleLabel').textContent = label.split(' ').slice(1).join(' ') || label;
 
-    // Update active state
     $$('.role-option').forEach(o => o.classList.toggle('active', o.dataset.role === role));
-
-    // Role-specific nav adjustments
     updateNavForRole(role);
     toast(`Role switched to ${label}`, 'info');
   }
 
   function updateNavForRole(role) {
-    // All roles see dashboard and incidents
-    // Role-specific visibility could be expanded here
     const navItems = {
       citizen: ['dashboard', 'incidents', 'report', 'map', 'adaptation', 'ecosystem'],
       operator: ['dashboard', 'incidents', 'report', 'map', 'queue', 'adaptation', 'ecosystem'],
@@ -177,23 +217,19 @@
 
   /* ── 5. Device Adaptation ───────────────────────────────── */
   function detectDevice() {
-    const ua = navigator.userAgent;
     const width = window.innerWidth;
     let deviceClass = 'desktop';
 
     if (width <= 640) deviceClass = 'mobile';
     else if (width <= 1024) deviceClass = 'tablet';
 
-    // Cheap device detection heuristic
     const memory = navigator.deviceMemory;
-    const cores = navigator.hardwareConcurrency;
     if (memory && memory <= 2) deviceClass += ' (low-end)';
     else if (memory && memory >= 8) deviceClass += ' (high-end)';
 
     state.deviceClass = deviceClass;
     $('#deviceClass').textContent = deviceClass;
 
-    // Network type
     const conn = navigator.connection;
     if (conn) {
       state.networkType = `${conn.effectiveType || 'unknown'} (${conn.downlink || '?'} Mbps)`;
@@ -202,7 +238,6 @@
       $('#networkType').textContent = navigator.onLine ? 'online' : 'offline';
     }
 
-    // Battery
     if ('getBattery' in navigator) {
       navigator.getBattery().then(battery => {
         const level = Math.round(battery.level * 100);
@@ -217,7 +252,6 @@
       });
     }
 
-    // Cache estimate
     if ('storage' in navigator && 'estimate' in navigator.storage) {
       navigator.storage.estimate().then(est => {
         const used = (est.usage / 1024 / 1024).toFixed(1);
@@ -233,18 +267,13 @@
       item.addEventListener('click', () => {
         const view = item.dataset.view;
         showView(view);
-
-        // Update active nav
         $$('.nav-item').forEach(n => n.classList.remove('active'));
         item.classList.add('active');
-
-        // Close mobile sidebar
         $('#appSidebar').classList.remove('open');
         $('#sidebarOverlay').classList.remove('visible');
       });
     });
 
-    // Mobile menu toggle
     $('#menuToggle').addEventListener('click', () => {
       $('#appSidebar').classList.toggle('open');
       $('#sidebarOverlay').classList.toggle('visible');
@@ -281,7 +310,6 @@
     if (dashList) dashList.innerHTML = html;
     if (fullList) fullList.innerHTML = html;
 
-    // Update timestamp
     const ts = new Date().toLocaleTimeString();
     const tsEl = $('#incidentListTime');
     if (tsEl) tsEl.textContent = ts;
@@ -342,11 +370,21 @@
     const form = $('#reportForm');
     if (!form) return;
 
-    form.addEventListener('submit', (e) => {
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
 
+      let runtime;
+      try {
+        runtime = await kpgsRuntimePromise;
+      } catch (error) {
+        console.error('[CC/KPGS] Runtime unavailable:', error);
+        toast('Local safety queue unavailable — report was not marked as sent', 'error');
+        return;
+      }
+
+      const updateId = runtime.newUpdateId();
       const report = {
-        id: `INC-${String(state.incidents.length + 1).padStart(3, '0')}`,
+        id: `INC-${updateId.slice(0, 8).toUpperCase()}`,
         type: $('#incidentType').value,
         severity: $('#incidentSeverity').value,
         title: `${$('#incidentType').selectedOptions[0]?.text || 'Report'} — ${$('#incidentLocation').value}`,
@@ -356,30 +394,35 @@
         time: 'just now',
         trust: 'unverified',
         timestamp: new Date().toISOString(),
-        synced: navigator.onLine
+        synced: false
       };
 
-      if (navigator.onLine) {
-        // Simulate API call
-        state.incidents.unshift(report);
-        renderIncidents();
-        toast('Incident reported successfully', 'success');
-      } else {
-        // Queue for offline sync
-        state.offlineQueue.push(report);
-        state.incidents.unshift(report);
-        updateQueueBanner();
-        renderIncidents();
-        toast('Report queued — will sync when online', 'warning');
+      const persisted = await runtime.queueIncidentReport(report, { update_id: updateId });
+      if (!persisted.admitted || persisted.receipt.code === 'LOCAL_PERSISTENCE_FAILED') {
+        console.warn('[CC/KPGS] Report mutation held:', persisted.receipt);
+        toast('Report could not be stored safely on this device', 'error');
+        return;
+      }
 
-        // Try background sync
-        if ('serviceWorker' in navigator && 'SyncManager' in window) {
-          navigator.serviceWorker.ready.then(reg => reg.sync.register('cc-offline-queue'));
-        }
+      state.incidents.unshift(report);
+      await refreshDurableOutbox();
+      renderIncidents();
+
+      if (navigator.onLine) {
+        toast('Report saved locally — awaiting confirmed upstream sync', 'warning');
+      } else {
+        toast('Report stored offline — it will remain queued until delivery is confirmed', 'warning');
+      }
+
+      // Background Sync only requests transport. It cannot clear the outbox or
+      // declare success without a real configured sink response.
+      if ('serviceWorker' in navigator && 'SyncManager' in window) {
+        navigator.serviceWorker.ready
+          .then(reg => reg.sync.register('cc-offline-queue'))
+          .catch(err => console.warn('[CC/KPGS] Background sync registration failed:', err));
       }
 
       form.reset();
-      // Update stats
       updateStats();
     });
   }
@@ -423,13 +466,18 @@
     if (!el) return;
 
     function update() {
+      if (!state.lastSync) {
+        el.textContent = 'not confirmed';
+        el.classList.add('stale-warning');
+        return;
+      }
+
       const diff = Math.floor((Date.now() - state.lastSync.getTime()) / 1000);
       if (diff < 10) el.textContent = 'just now';
       else if (diff < 60) el.textContent = `${diff}s ago`;
       else if (diff < 3600) el.textContent = `${Math.floor(diff / 60)}m ago`;
       else el.textContent = `${Math.floor(diff / 3600)}h ago`;
 
-      // Stale warning
       if (diff > 1800) {
         el.classList.add('stale-warning');
         el.textContent += ' ⚠️';
@@ -489,25 +537,36 @@
     const syncBtn = $('#forceSync');
     const syncAllBtn = $('#syncAll');
 
-    function doSync() {
-      if (state.offlineQueue.length === 0) {
+    async function doSync() {
+      const pending = await refreshDurableOutbox();
+      if (pending.length === 0) {
         toast('Nothing to sync', 'info');
         return;
       }
       if (!navigator.onLine) {
-        toast('Cannot sync — no connectivity', 'error');
+        toast('Cannot sync yet — no connectivity. Reports remain stored locally.', 'error');
+        return;
+      }
+      if (!('serviceWorker' in navigator)) {
+        toast('Sync worker unavailable — reports remain stored locally', 'error');
         return;
       }
 
-      // Simulate sync
-      toast(`Syncing ${state.offlineQueue.length} items...`, 'info');
-      setTimeout(() => {
-        state.offlineQueue = [];
-        state.lastSync = new Date();
-        updateQueueBanner();
-        updateSyncDisplay();
-        toast('All items synced successfully', 'success');
-      }, 1500);
+      const reg = await navigator.serviceWorker.ready;
+      toast(`Sync requested for ${pending.length} queued item${pending.length === 1 ? '' : 's'} — waiting for upstream confirmation`, 'info');
+
+      if ('SyncManager' in window) {
+        try {
+          await reg.sync.register('cc-offline-queue');
+          return;
+        } catch (error) {
+          console.warn('[CC/KPGS] Background sync registration failed:', error);
+        }
+      }
+
+      if (reg.active) {
+        reg.active.postMessage({ type: 'PROCESS_OUTBOX' });
+      }
     }
 
     if (syncBtn) syncBtn.addEventListener('click', doSync);
@@ -535,19 +594,19 @@
     renderIncidents();
     renderAdaptationStatus();
     initReportForm();
-    updateQueueBanner();
+    refreshDurableOutbox();
     updateSyncDisplay();
     initInstallPrompt();
     initForceSync();
     initClock();
     updateStats();
-    initUserMenu();  // ── USER DROP MENU ─────────────────────
+    initUserMenu();
 
-    // Set initial role
     setRole('citizen', '👤', '👤 Citizen');
 
     console.log('[CrisisConnect] Adaptive PWA initialized');
     console.log('[CrisisConnect] 6 dimensions active: connectivity, role, urgency, device, trust, local');
+    console.log('[CrisisConnect] Progressive incident outbox: durable pending proposals; no unreceipted sync claims');
     console.log('[CrisisConnect] USER DROP MENU: active | IKP: CLEAN | 360DP: VIP ####!!!!');
   }
 
@@ -560,7 +619,7 @@
    * I_AM_STATELESS_RENTER_NOT_LANDLORD
    */
   const UMP_KEY       = 'cc_pilot_profile';
-  const UMP_ALP_COUNT = 13;    // current ALP activation count
+  const UMP_ALP_COUNT = 13;
   const UMP_DSO       = 'HDSO ###!!!';
   const UMP_IKP       = 'IKP: CLEAN';
   const UMP_360DP     = '360DP: VIP ####!!!!';
@@ -598,13 +657,11 @@
     const session   = (pilot && pilot.session_start) ? formatSessionTime(pilot.session_start) : '0m';
     const roleLabel = state.role.charAt(0).toUpperCase() + state.role.slice(1);
 
-    // Trigger button
     const avatarEl    = $('#userAvatar');
     const callsignEl  = $('#userCallsign');
     if (avatarEl)   avatarEl.textContent   = initials;
     if (callsignEl) callsignEl.textContent = callsign;
 
-    // Panel
     const nameEl    = $('#umpName');
     const roleEl    = $('#umpRole');
     const avatarLg  = $('#umpAvatarLg');
@@ -628,11 +685,9 @@
     if (dpEl)     dpEl.textContent    = UMP_360DP;
     if (dsoEl)    dsoEl.textContent   = `DSO: ${UMP_DSO}`;
 
-    // Urgency toggle label
     const nextUrgency = { normal: 'active', active: 'mass', mass: 'normal' }[state.urgency];
     if (urgEl) urgEl.textContent = `Switch to ${nextUrgency} mode`;
 
-    // Offline queue badge in UMP
     const qBadge = $('#umpQueueBadge');
     if (qBadge) {
       const qCount = state.offlineQueue.length;
@@ -668,7 +723,6 @@
   }
 
   function initUserMenu() {
-    // Ensure/bootstrap pilot profile
     let pilot = loadPilot();
     if (!pilot) {
       pilot = {
@@ -682,16 +736,13 @@
       };
       savePilot(pilot);
     } else {
-      // Refresh session start on each boot
       pilot.session_start = new Date().toISOString();
       pilot.alp_count     = UMP_ALP_COUNT;
       savePilot(pilot);
     }
 
-    // Render initial state into trigger button
     umpRender(pilot);
 
-    // Toggle on trigger click
     const trigger = $('#userMenuTrigger');
     if (trigger) {
       trigger.addEventListener('click', (e) => {
@@ -700,7 +751,6 @@
       });
     }
 
-    // Close on outside click
     document.addEventListener('click', (e) => {
       const wrap = $('#userMenuWrap');
       if (wrap && !wrap.contains(e.target)) {
@@ -708,12 +758,10 @@
       }
     });
 
-    // Close on Escape
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') umpClose();
     });
 
-    // Edit callsign
     const umpEdit = $('#umpEditProfile');
     if (umpEdit) {
       umpEdit.addEventListener('click', () => {
@@ -727,7 +775,6 @@
       });
     }
 
-    // Save callsign
     const umpSave = $('#umpCallsignSave');
     if (umpSave) {
       umpSave.addEventListener('click', () => {
@@ -744,7 +791,6 @@
       });
     }
 
-    // Cancel callsign modal
     const umpCancel = $('#umpCallsignCancel');
     if (umpCancel) {
       umpCancel.addEventListener('click', () => {
@@ -753,7 +799,6 @@
       });
     }
 
-    // Enter key in callsign input → save
     const umpInput = $('#umpCallsignInput');
     if (umpInput) {
       umpInput.addEventListener('keydown', (e) => {
@@ -761,7 +806,6 @@
       });
     }
 
-    // View offline queue
     const umpQueue = $('#umpViewQueue');
     if (umpQueue) {
       umpQueue.addEventListener('click', () => {
@@ -772,7 +816,6 @@
       });
     }
 
-    // Toggle urgency
     const umpUrgency = $('#umpToggleUrgency');
     if (umpUrgency) {
       umpUrgency.addEventListener('click', () => {
@@ -782,7 +825,6 @@
       });
     }
 
-    // Go to ecosystem
     const umpEco = $('#umpEcosystem');
     if (umpEco) {
       umpEco.addEventListener('click', () => {
@@ -793,12 +835,11 @@
       });
     }
 
-    // Sign out / reset pilot
     const umpOut = $('#umpSignOut');
     if (umpOut) {
       umpOut.addEventListener('click', () => {
         umpClose();
-        if (!confirm('Reset all pilot data on this device? This cannot be undone.')) return;
+        if (!confirm('Reset pilot profile on this device? Queued incident reports are retained until delivered.')) return;
         localStorage.removeItem(UMP_KEY);
         const fresh = {
           callsign:      'Guest',
@@ -811,25 +852,23 @@
         };
         savePilot(fresh);
         umpRender(fresh);
-        toast('Pilot data reset. Flying as Guest.', 'info');
+        toast('Pilot profile reset. Queued incident proposals were not deleted.', 'info');
       });
     }
 
-    // Hook: track reports in profile
+    // Track submission attempts as reports, but never infer remote synchronization
+    // from navigator.onLine. Only SYNC_COMPLETE increments synced_count.
     const reportForm = $('#reportForm');
     if (reportForm) {
       reportForm.addEventListener('submit', () => {
         const p = loadPilot() || {};
         p.reports_count = (p.reports_count || 0) + 1;
-        if (navigator.onLine) p.synced_count = (p.synced_count || 0) + 1;
         savePilot(p);
-        // Update session timer in panel if open
         const panel = $('#userMenuPanel');
         if (panel && !panel.classList.contains('is-hidden')) umpRender(p);
       });
     }
 
-    // Refresh session timer every 60s
     setInterval(() => {
       const panel = $('#userMenuPanel');
       if (panel && !panel.classList.contains('is-hidden')) {
@@ -844,4 +883,3 @@
     init();
   }
 })();
-
