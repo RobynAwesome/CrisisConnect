@@ -4,11 +4,14 @@
   "codename": "CRISIS-C",
   "title": "CrisisConnect Disaster response node",
   "main_brain_ref": "Schematics/21-KOPANO-PHU GOVERNACE SYSTEMS/MAIN-BRAIN/KPGS_GOVERNANCE_CORE.json",
-  "github_repo": "https://github.com/Kopano-Labs/CrisisConnect",
+  "github_repo": "https://github.com/RobynAwesome/CrisisConnect",
   "vercel_url": "https://crisisconnect.kopanolabs.com",
+  "sync_endpoint": null,
+  "sync_state": "HOLD_NO_CONFIGURED_SINK",
+  "truth_boundary": "incident reports are pending proposals; browser transport never verifies incident truth or grants response authority",
   "verification": {
     "auditor": "self_audit.py",
-    "required_files": ["index.html", "index.css", "app.js", "self_audit.py"],
+    "required_files": ["index.html", "index.css", "app.js", "kpgs-outbox.js", "self_audit.py"],
     "allowed_lattice_edges": [
       ["crud", "gui"],
       ["telemetry", "blackmask"]
