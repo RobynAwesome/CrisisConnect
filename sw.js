@@ -1,9 +1,11 @@
 /* ═══════════════════════════════════════════════════════════
    CrisisConnect Service Worker — Adaptive Offline Strategy
-   Cache-first for shell, network-first for API, offline queue
+   Cache-first for shell, network-first for API, governed outbox
    ═══════════════════════════════════════════════════════════ */
 
-const CACHE_VERSION = 'cc-adaptive-v1';
+importScripts('/kpgs-outbox.js');
+
+const CACHE_VERSION = 'cc-adaptive-v2';
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const DATA_CACHE = `${CACHE_VERSION}-data`;
 
@@ -12,6 +14,8 @@ const SHELL_ASSETS = [
   '/index.html',
   '/index.css',
   '/app.js',
+  '/kpgs-outbox.js',
+  '/kpgs_config.json',
   '/manifest.json'
 ];
 
@@ -76,19 +80,63 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
-/* ── Background Sync: process offline queue ────────────── */
+async function loadSyncEndpoint() {
+  try {
+    const cached = await caches.match('/kpgs_config.json');
+    if (!cached) return '';
+    const config = await cached.json();
+    return typeof config.sync_endpoint === 'string' ? config.sync_endpoint.trim() : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+async function notifyClients(message) {
+  const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  clients.forEach(client => client.postMessage(message));
+}
+
+/* ── Background Sync: process governed durable outbox ─── */
 self.addEventListener('sync', (event) => {
   if (event.tag === 'cc-offline-queue') {
     event.waitUntil(processOfflineQueue());
   }
 });
 
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'PROCESS_OUTBOX') {
+    event.waitUntil(processOfflineQueue());
+  }
+});
+
 async function processOfflineQueue() {
-  // Retrieve and process queued items from IndexedDB
-  const clients = await self.clients.matchAll();
-  clients.forEach(client => {
-    client.postMessage({ type: 'SYNC_COMPLETE', ts: new Date().toISOString() });
+  const endpoint = await loadSyncEndpoint();
+  const result = await self.CrisisOutbox.syncPending({ endpoint });
+
+  if (result.complete) {
+    // SWFUS distribution PASS is allowed only after the configured receiving
+    // sink returned success for every attempted pending proposal.
+    await notifyClients({
+      type: 'SYNC_COMPLETE',
+      delivered: result.delivered,
+      retained: result.retained,
+      detail: result.detail,
+      ts: new Date().toISOString()
+    });
+    return result;
+  }
+
+  // No sink or failed transport is a truthful pending state. Never collapse it
+  // into a successful dispatch/sync claim.
+  await notifyClients({
+    type: 'SYNC_PENDING',
+    delivered: result.delivered,
+    retained: result.retained,
+    code: result.code,
+    detail: result.detail,
+    ts: new Date().toISOString()
   });
+  return result;
 }
 
 /* ── Push Notifications ────────────────────────────────── */
